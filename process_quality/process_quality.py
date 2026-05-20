@@ -33,7 +33,8 @@ EXE_PATH = r"C:\Users\Public\Desktop\종합생산시스템.lnk"
 USERNAME = "pjys0520"
 PASSWORD = "1360"
 WAIT_FOR_WINDOW = 5
-IMG_DIR = Path(__file__).parent / "images"
+IMG_DIR    = Path(__file__).parent / "images"
+CHARTS_DIR = Path(__file__).parent / "charts"
 
 pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0.3
@@ -45,8 +46,11 @@ MENU_STEPS = [
 ]
 
 CAMERA_EXCEL_PATH = r"C:\Users\jungsunghun\Desktop\CAMERA공정능력분석26년.xlsx"
-DNVR_EXCEL_PATH   = r""  # DNVR 엑셀 파일 경로 (추후 입력)
+DNVR_EXCEL_PATH   = r"C:\Users\jungsunghun\Desktop\DNVR공정능력분석26년.xlsx"
 STAMP_IMAGE_PATH  = str(IMG_DIR / "stamp.png")
+_CM_TO_PT   = 28.3465
+STAMP_W_PT  = 5.86 * _CM_TO_PT   # 5.86 cm
+STAMP_H_PT  = 2.66 * _CM_TO_PT   # 2.66 cm
 
 
 def _find_tims_pids() -> set[int]:
@@ -604,6 +608,13 @@ def _write_data_table(sheet, data: dict):
     print(f"[*] 데이터 테이블 업데이트 완료: A{TABLE_ROW} ({n}일 + 합계)")
 
 
+def _safe_int(v) -> int:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _read_monthly_sheet_daily_data(sheet) -> list:
     """월별 시트 테이블(row20~)에서 일별 (생산수, 불량수) 리스트 반환."""
     TABLE_ROW = 20
@@ -612,10 +623,10 @@ def _read_monthly_sheet_daily_data(sheet) -> list:
         구분_val = sheet.cells(TABLE_ROW, col).value
         if 구분_val is None or str(구분_val).strip() == "합계":
             break
-        prod   = sheet.cells(TABLE_ROW + 1, col).value or 0
-        defect = sheet.cells(TABLE_ROW + 2, col).value or 0
+        prod   = _safe_int(sheet.cells(TABLE_ROW + 1, col).value)
+        defect = _safe_int(sheet.cells(TABLE_ROW + 2, col).value)
         if prod > 0:
-            result.append((int(prod), int(defect)))
+            result.append((prod, defect))
     return result
 
 
@@ -666,37 +677,20 @@ def _insert_sheet_images(sheet, chart_path: str, data: dict):
     elif chart_path:
         print(f"[!] 차트 파일 없음: {chart_path}")
 
-    # ── 작성/검토/승인 스탬프: 합계 직전 4열, 차트 하단 우측 ─────────
+    # ── 작성/검토/승인 스탬프: 합계 열 우측 끝에 고정 크기로 배치 ─────
     if STAMP_IMAGE_PATH and Path(STAMP_IMAGE_PATH).exists():
-        stamp_end_col   = last_col                # 합계 열까지 (우측 끝)
-        stamp_start_col = max(stamp_end_col - 3, 2)  # 4열 너비
-
-        s_left  = sheet.cells(1, stamp_start_col).left
-        s_right = (sheet.cells(1, stamp_end_col).left
-                   + sheet.cells(1, stamp_end_col).width)
-        s_width = s_right - s_left
-
-        # 원본 이미지 비율 유지
-        try:
-            from PIL import Image as _PilImg
-            with _PilImg.open(STAMP_IMAGE_PATH) as im:
-                iw, ih = im.size
-            s_height = s_width * ih / iw
-        except Exception:
-            s_height = s_width * 0.45  # PIL 없을 때 근사 비율
-
-        # row1 상단에 맞춰 배치 (타이틀 행 우측 끝)
-        s_top = sheet.cells(1, 1).top
-
+        s_right = sheet.cells(1, last_col).left + sheet.cells(1, last_col).width
+        s_top   = sheet.cells(1, 1).top
         sheet.api.Shapes.AddPicture(
             Filename=str(STAMP_IMAGE_PATH),
             LinkToFile=False, SaveWithDocument=True,
-            Left=s_left, Top=s_top, Width=s_width, Height=s_height,
+            Left=s_right - STAMP_W_PT, Top=s_top,
+            Width=STAMP_W_PT, Height=STAMP_H_PT,
         )
-        print(f"[*] 스탬프 삽입: col{stamp_start_col}~{stamp_end_col} / row19 하단 기준")
+        print(f"[*] 스탬프 삽입: col{last_col} 우측 끝 / row1 기준  {STAMP_W_PT:.0f}×{STAMP_H_PT:.0f}pt")
 
 
-def _update_accum_sheet(wb, data: dict, year: int, month: int):
+def _update_accum_sheet(wb, data: dict, year: int, month: int, accum_data: dict = None):
     year_short = str(year)[2:]
     accum_candidates = [f"{year_short}년 누적", f"{year_short}년누적", "누적"]
     sheet_names = [s.name for s in wb.sheets]
@@ -766,13 +760,15 @@ def _update_accum_sheet(wb, data: dict, year: int, month: int):
     _put("Ppk",    month_col, round(ppk,   2))
     _put("등급",   month_col, grade)
 
-    # 26년 누계 열 갱신 (기존 누계 + 이번 달)
+    # 누계 열 갱신 — 월별 시트에서 읽어온 일별 원본 데이터를 합산 (항상 처음부터 재계산)
     if accum_col:
-        ex_prod   = int(accum.cells(row_map["생산수"], accum_col).value or 0)
-        ex_defect = int(accum.cells(row_map["불량수"],  accum_col).value or 0)
-        new_prod   = ex_prod   + prod_total
-        new_defect = ex_defect + defect_total
-        new_rate   = new_defect / new_prod if new_prod > 0 else 0
+        if accum_data:
+            new_prod   = sum(int(v["총수량/2"]) for v in accum_data.values())
+            new_defect = sum(int(v["불량수"])   for v in accum_data.values())
+        else:
+            new_prod   = prod_total
+            new_defect = defect_total
+        new_rate = new_defect / new_prod if new_prod > 0 else 0
 
         _clamp = lambda v: max(min(v, 1 - 1e-9), 1e-9)
         pz_cum    = stats.norm.ppf(1 - _clamp(new_rate))
@@ -785,6 +781,21 @@ def _update_accum_sheet(wb, data: dict, year: int, month: int):
         _put("시그마",  accum_col, round(sigma_cum, 2))
         _put("Ppk",    accum_col, round(ppk_cum,   2))
         _put("등급",   accum_col, _ppk_grade(ppk_cum))
+
+        # A1 영역 시그마수준/Ppk 텍스트 갱신 (누계 기준값으로)
+        grade_cum = _ppk_grade(ppk_cum)
+        for r in range(1, 6):
+            for c in range(1, 30):
+                val = accum.cells(r, c).value
+                if not isinstance(val, str):
+                    continue
+                new_val = re.sub(r'시그마수준\s+[\d.]+σ',
+                                 f'시그마수준 {sigma_cum:.1f}σ', val)
+                new_val = re.sub(r'Ppk\s+[\d.]+-\d+등급',
+                                 f'Ppk {ppk_cum:.2f}-{grade_cum}등급', new_val)
+                if new_val != val:
+                    accum.cells(r, c).value = new_val
+        print(f"[*] 누적 시트 A1 영역 갱신: 시그마수준 {sigma_cum:.1f}σ  Ppk {ppk_cum:.2f}-{grade_cum}등급")
 
     print(f"[*] 누적 시트 '{month_label}' 업데이트 완료  (누계열={'있음' if accum_col else '없음'})")
 
@@ -873,42 +884,51 @@ def update_excel_report(year: int, month: int, excel_path: str, data: dict = Non
             print(f"[*] 시그마수준={sigma_z:.1f}σ  Ppk={ppk:.2f}  {grade}등급")
 
         if data:
-            _update_accum_sheet(wb, data, year, month)
-
-            # 누적 시트 월별 P-chart 생성
             year_short       = str(year)[2:]
             accum_candidates = [f"{year_short}년 누적", f"{year_short}년누적", "누적"]
             accum_sh = next(
                 (wb.sheets[n] for n in accum_candidates if n in [s.name for s in wb.sheets]),
                 None,
             )
-            if accum_sh:
-                accum_data = _read_accum_all_daily_data(wb, year, month)
-                if accum_data:
-                    accum_chart = str(
-                        Path(excel_path).parent / f"p_chart_accum_{year}_{month:02d}.png"
-                    )
-                    generate_p_chart(
-                        accum_data, year, month,
-                        product_name or "제품",
-                        accum_chart,
-                        title=f"{year}년 {product_name}  공정능력현황 [누적 1~{month}월]",
-                    )
+            accum_data = _read_accum_all_daily_data(wb, year, month) if accum_sh else None
+            _update_accum_sheet(wb, data, year, month, accum_data)
 
-                    # 누적 시트 A6:P21에 차트 삽입
-                    shapes = accum_sh.api.Shapes
-                    for i in range(shapes.Count, 0, -1):
-                        shapes.Item(i).Delete()
-                    left   = accum_sh.range("A6").left
-                    top    = accum_sh.range("A6").top
-                    right  = accum_sh.range("P21").left + accum_sh.range("P21").width
-                    bottom = accum_sh.range("P21").top  + accum_sh.range("P21").height
+            if accum_sh and accum_data:
+                accum_name  = f"{product_name}_accum" if product_name else f"p_chart_accum_{year}_{month:02d}"
+                accum_chart = str(CHARTS_DIR / f"{accum_name}.png")
+                generate_p_chart(
+                    accum_data, year, month,
+                    product_name or "제품",
+                    accum_chart,
+                    title=f"{year}년 {product_name}  공정능력현황 [누적 1~{month}월]",
+                )
+
+                # 누적 시트 A6:P21에 차트 삽입
+                shapes = accum_sh.api.Shapes
+                for i in range(shapes.Count, 0, -1):
+                    shapes.Item(i).Delete()
+                left   = accum_sh.range("A6").left
+                top    = accum_sh.range("A6").top
+                right  = accum_sh.range("P21").left + accum_sh.range("P21").width
+                bottom = accum_sh.range("P21").top  + accum_sh.range("P21").height
+                accum_sh.api.Shapes.AddPicture(
+                    Filename=accum_chart,
+                    LinkToFile=False, SaveWithDocument=True,
+                    Left=left, Top=top, Width=right - left, Height=bottom - top,
+                )
+                print("[*] 누적 차트 삽입: A6:P21")
+
+                # 누적 시트 스탬프 삽입 (P열 우측 끝, 고정 크기)
+                if STAMP_IMAGE_PATH and Path(STAMP_IMAGE_PATH).exists():
+                    s_right = accum_sh.range("P1").left + accum_sh.range("P1").width
+                    s_top   = accum_sh.range("A1").top
                     accum_sh.api.Shapes.AddPicture(
-                        Filename=accum_chart,
+                        Filename=str(STAMP_IMAGE_PATH),
                         LinkToFile=False, SaveWithDocument=True,
-                        Left=left, Top=top, Width=right - left, Height=bottom - top,
+                        Left=s_right - STAMP_W_PT, Top=s_top,
+                        Width=STAMP_W_PT, Height=STAMP_H_PT,
                     )
-                    print("[*] 누적 차트 삽입: A6:P21")
+                    print(f"[*] 누적 시트 스탬프 삽입: P1 우측 끝  {STAMP_W_PT:.0f}×{STAMP_H_PT:.0f}pt")
 
         wb.save()
         wb.close()
@@ -921,7 +941,7 @@ def update_excel_report(year: int, month: int, excel_path: str, data: dict = Non
 
 
 def _run_inquiry_and_chart(prev_year: int, prev_month: int, last_day: int,
-                            product_name: str, chart_filename: str) -> dict:
+                            product_name: str, chart_path: str) -> dict:
     if not click_image("btn_dataInquiry", timeout=10.0):
         abort("조회 버튼을 찾지 못했습니다.")
     time.sleep(3)
@@ -933,8 +953,7 @@ def _run_inquiry_and_chart(prev_year: int, prev_month: int, last_day: int,
     for day, vals in data.items():
         print(f"  {day:2d}일  총수량/2={vals['총수량/2']}  불량수={vals['불량수']}")
 
-    chart_path = Path(__file__).parent / chart_filename
-    generate_p_chart(data, prev_year, prev_month, product_name, str(chart_path))
+    generate_p_chart(data, prev_year, prev_month, product_name, chart_path)
     wb.close()
     print(f"[*] {product_name} 완료")
     return data
@@ -951,15 +970,16 @@ if __name__ == "__main__":
     prev_year = today.year if today.month > 1 else today.year - 1
     last_day = calendar.monthrange(prev_year, prev_month)[1]
 
-    dnvr_chart   = str(Path(__file__).parent / f"p_chart_{prev_year}_{prev_month:02d}.png")
-    camera_chart = str(Path(__file__).parent / f"p_chart_camera_{prev_year}_{prev_month:02d}.png")
+    CHARTS_DIR.mkdir(exist_ok=True)
+    dnvr_chart   = str(CHARTS_DIR / "DNVR_chart.png")
+    camera_chart = str(CHARTS_DIR / "IPC_chart.png")
 
     # ── DNVR ─────────────────────────────────────────────────────────
     print("[*] DNVR 조회 시작")
     dnvr_data = _run_inquiry_and_chart(
         prev_year, prev_month, last_day,
         product_name="DNVR",
-        chart_filename=Path(dnvr_chart).name,
+        chart_path=dnvr_chart,
     )
     update_excel_report(prev_year, prev_month, DNVR_EXCEL_PATH, data=dnvr_data, chart_path=dnvr_chart, product_name="DNVR")
 
@@ -973,6 +993,6 @@ if __name__ == "__main__":
     camera_data = _run_inquiry_and_chart(
         prev_year, prev_month, last_day,
         product_name="IPC",
-        chart_filename=Path(camera_chart).name,
+        chart_path=camera_chart,
     )
     update_excel_report(prev_year, prev_month, CAMERA_EXCEL_PATH, data=camera_data, chart_path=camera_chart, product_name="IPC")
